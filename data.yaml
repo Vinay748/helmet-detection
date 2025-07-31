@@ -1,0 +1,5 @@
+train: images/train
+val: images/val
+
+nc: 2
+names: ['person_with_helmet', 'person_without_helmet']
