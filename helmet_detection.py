@@ -1,6 +1,5 @@
 import cv2
 import sys
-import threading
 import time
 import pygame
 from ultralytics import YOLO
@@ -16,10 +15,9 @@ class HelmetDetection:
         self.alarm_on = False
         self.fps_start_time = time.time()
         self.fps_frame_count = 0
-        self.no_helmet_frame_count = 0
-        self.helmet_frame_count = 0
-        self.detection_buffer_size = 20  # Increased buffer for smoothing
-        self.required_no_helmet_frames = 10  # Smoother transitions
+        self.no_helmet_frame_buffer = 0
+        self.required_consecutive_no_helmet_frames = 15
+        self.required_consecutive_helmet_frames = 10
 
     def start_alarm(self):
         if not self.alarm_on:
@@ -28,13 +26,20 @@ class HelmetDetection:
             self.alarm_on = True
 
     def stop_alarm(self):
-        if self.alarm_on and self.alarm_channel and self.alarm_channel.get_busy():
-            print("[ALARM] All helmets detected. Alarm OFF!")
+        if self.alarm_on:
+            print("[ALARM] Helmet detected. Alarm OFF!")
             self.alarm_channel.stop()
             self.alarm_on = False
 
+    def draw_overlay_text(self, frame, lines, start_y=30, color=(255, 255, 255)):
+        y = start_y
+        for line, col in lines:
+            cv2.putText(frame, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, col, 2)
+            y += 30
+        return y  # Return last y for chaining other overlays
+
     def detect_and_count(self, frame):
-        results = self.model.predict(frame, imgsz=640, conf=0.7)  # Increased confidence threshold
+        results = self.model.predict(frame, imgsz=640, conf=0.7)
         helmet_count = 0
         no_helmet_count = 0
 
@@ -46,49 +51,65 @@ class HelmetDetection:
             for box, cls_id, conf in zip(boxes, classes, confs):
                 width = int(box[2] - box[0])
                 height = int(box[3] - box[1])
-                min_box_size = 50  # Ignore small boxes (false positives)
-                if width < min_box_size or height < min_box_size:
-                    continue  # Skip small bounding boxes
+                min_box_size = 50
 
-                if cls_id == 0:  # Helmet class
+                if width < min_box_size or height < min_box_size:
+                    continue
+
+                if cls_id == 0:  # Helmet
                     helmet_count += 1
                     color = (0, 255, 0)
-                    label = f"With Helmet {conf:.2f}"
-                else:  # Head class (No Helmet)
+                    label = f"Helmet {conf:.2f}"
+                elif cls_id == 1:  # Head (No Helmet)
                     no_helmet_count += 1
                     color = (0, 0, 255)
-                    label = f"Without Helmet {conf:.2f}"
+                    label = f"No Helmet {conf:.2f}"
+                else:
+                    continue
 
-                cv2.rectangle(frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 3)
-                cv2.putText(frame, label, (int(box[0]), int(box[1])-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+                cv2.rectangle(frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
+                cv2.putText(frame, label, (int(box[0]), int(box[1]) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
         total_persons = helmet_count + no_helmet_count
+        print(f"Total Persons: {total_persons}, With Helmet: {helmet_count}, Without Helmet: {no_helmet_count}")
 
-        # Detection Smoothing Logic
+        # Buffering logic for Alarm
         if no_helmet_count > 0:
-            self.no_helmet_frame_count += 1
-            self.helmet_frame_count = max(0, self.helmet_frame_count - 1)
+            self.no_helmet_frame_buffer += 1
         else:
-            self.helmet_frame_count += 1
-            self.no_helmet_frame_count = max(0, self.no_helmet_frame_count - 1)
+            self.no_helmet_frame_buffer = 0  # Reset if no head detected without helmet
 
-        # Alarm Trigger Condition
-        if self.no_helmet_frame_count >= self.required_no_helmet_frames:
+        if self.no_helmet_frame_buffer >= self.required_consecutive_no_helmet_frames:
             self.start_alarm()
-        elif self.helmet_frame_count >= self.required_no_helmet_frames:
-            self.stop_alarm()
+        elif no_helmet_count == 0 and helmet_count > 0:
+            self.required_consecutive_helmet_frames -= 1
+            if self.required_consecutive_helmet_frames <= 0:
+                self.stop_alarm()
+                self.required_consecutive_helmet_frames = 10
+        else:
+            self.required_consecutive_helmet_frames = 10
 
-        # Display Summary Stats
-        summary = f"Total: {total_persons} | With Helmet: {helmet_count} | Without Helmet: {no_helmet_count}"
-        cv2.putText(frame, summary, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+        # Overlay counts with colors
+        overlay_lines = [
+            (f"Total Persons: {total_persons}", (0, 255, 255)),   # Yellow
+            (f"With Helmet: {helmet_count}", (0, 255, 0)),        # Green
+            (f"No Helmet: {no_helmet_count}", (0, 0, 255))        # Red
+        ]
+        last_y = self.draw_overlay_text(frame, overlay_lines, start_y=30)
 
-        # FPS Display
+        # FPS Calculation every 10 frames
         self.fps_frame_count += 1
         if self.fps_frame_count >= 10:
             fps = self.fps_frame_count / (time.time() - self.fps_start_time)
-            cv2.putText(frame, f'FPS: {fps:.2f}', (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
             self.fps_start_time = time.time()
             self.fps_frame_count = 0
+            self.current_fps = fps  # Store FPS for display
+        if hasattr(self, 'current_fps'):
+            cv2.putText(frame, f'FPS: {self.current_fps:.2f}', (20, last_y + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        # Blinking ALARM Text
+        if self.alarm_on and int(time.time() * 2) % 2 == 0:
+            cv2.putText(frame, '*** ALARM ON ***', (150, 450), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 4)
 
         return frame
 
@@ -155,7 +176,6 @@ class HelmetDetection:
             cap.release()
             cv2.destroyAllWindows()
 
-            # Ask if user wants to load another video
             next_video = input("Load another video? (y/n): ").strip().lower()
             if next_video != 'y':
                 break
